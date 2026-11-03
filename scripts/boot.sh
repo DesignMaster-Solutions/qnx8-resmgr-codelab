@@ -18,9 +18,11 @@ for ((i = 0; i < T; i++)); do
   sleep 1
 done
 sleep 2 # let the last lines reach the log
-tr -d '\r' < "$LOG" | grep -E '^(codelab:|c[-rwx]{9} )' || true
+tr -d '\r' < "$LOG" | grep -E '^(codelab:|c[-rwx]{9} | *[0-9]+ +1 system/bin/ticks)' || true
 grep -q "codelab: read 1: Hello from a QNX 8.0 resource manager" "$LOG"
 grep -q "codelab: read 2: Hi from the shell" "$LOG"
 grep -q "codelab: long write refused" "$LOG"
 grep -q "codelab: read 3: Hi from the shell" "$LOG"
+grep -q "codelab: ticks grew" "$LOG"
+grep -Eq "system/bin/ticks +20f " "$LOG"
 echo "boot: all checks passed"

@@ -7,8 +7,10 @@ source "$HOME/qnx800/qnxsdp-env.sh" >/dev/null
 mkdir -p /vm/bin /vm/local/snippets
 qcc -Vgcc_ntox86_64 -std=c11 -D_QNX_SOURCE -Wall -Wextra -Werror -O2 /work/src/hello.c -o /vm/bin/hello
 file /vm/bin/hello
+qcc -Vgcc_ntox86_64 -std=c11 -D_QNX_SOURCE -Wall -Wextra -Werror -O2 /work/src/ticks.c -o /vm/bin/ticks
 # Put the binary in the image as /system/bin/hello.
 echo "[perms=555] bin/hello=/vm/bin/hello" > /vm/local/snippets/system_files.custom
+echo "[perms=555] bin/ticks=/vm/bin/ticks" >> /vm/local/snippets/system_files.custom
 # Commands the image runs at the end of boot. The "codelab:" lines are what scripts/boot.sh checks.
 cat > /vm/local/snippets/post_start.custom <<'SH'
 echo "codelab: booted $(uname -sr)"
@@ -24,6 +26,17 @@ else
     echo "codelab: long write refused"
 fi
 echo "codelab: read 3: $(cat /dev/hello)"
+/system/bin/ticks &
+waitfor /dev/ticks 10
+first=$(cat /dev/ticks)
+sleep 1
+second=$(cat /dev/ticks)
+if [ "${second#ticks=}" -gt "${first#ticks=}" ]; then
+    echo "codelab: ticks grew"
+else
+    echo "codelab: ticks did not grow: $first $second"
+fi
+pidin -p ticks
 echo "codelab: done"
 SH
 cd /vm

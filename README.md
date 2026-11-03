@@ -10,6 +10,7 @@ In this codelab you write one of those processes: `/dev/hello`. `cat /dev/hello`
 2. Cross-compile for QNX with `qcc`.
 3. Write a resource manager: the dispatch loop, the default POSIX handlers, and your own `read` and `write`.
 4. Build a bootable QNX 8.0 image with `mkqnximage`, boot it in QEMU and check the console output.
+5. Add real-time behavior: a monotonic timer that delivers pulses to the dispatch loop, at a fixed priority.
 
 **What you need**
 
@@ -32,6 +33,7 @@ cd qnx8-resmgr-codelab
 | `host/install-sdp.sh` | Installs the SDP headless into a Docker volume (step 2) |
 | `host/Dockerfile` | Small Linux image that runs `qcc` and `mkqnximage` (step 3) |
 | `src/hello.c` | The resource manager (step 4) |
+| `src/ticks.c` | The same pattern with a timer pulse and a fixed priority (step 7) |
 | `scripts/build-image.sh` | Compiles `hello.c` and builds the QNX image (step 5) |
 | `scripts/boot.sh` | Boots the image in QEMU and checks what `/dev/hello` answered (step 6) |
 
@@ -68,7 +70,7 @@ docker build -t qnx-host host
 
 ## 4. Read the resource manager
 
-Open [`src/hello.c`](src/hello.c). It is 85 lines long and has four parts.
+Open [`src/hello.c`](src/hello.c). It has four parts.
 
 **Register a path.** `dispatch_create()` makes the channel that receives client messages. `iofunc_func_init()` fills in the default POSIX handlers for open, close, stat, chmod and the rest. You override only `read` and `write`. `iofunc_attr_init(&attr, S_IFCHR | 0666, ...)` defines what `ls -l /dev/hello` will show: a character device that anyone can read and write. `resmgr_attach()` tells the process manager that `/dev/hello` belongs to this process.
 
@@ -128,11 +130,13 @@ codelab: read 1: Hello from a QNX 8.0 resource manager
 codelab: read 2: Hi from the shell
 codelab: long write refused
 codelab: read 3: Hi from the shell
+codelab: ticks grew
+  360467   1 system/bin/ticks              20f RECEIVE        1
 codelab: done
 boot: all checks passed
 ```
 
-The output tells you four things:
+The first lines tell you four things (step 7 explains the `ticks` lines):
 
 - The device exists with the type and permissions from `iofunc_attr_init`.
 - `cat` read the whole message once and stopped at EOF.
@@ -141,16 +145,62 @@ The output tells you four things:
 
 To run your own commands on the target, add them to `post_start.custom` in `scripts/build-image.sh` and run steps 5 and 6 again.
 
-## 7. Try next
+## 7. Add real-time behavior: a timer pulse
+
+A resource manager only runs when a client calls it. Most real-time programs also have work of their own: sample a sensor, check a deadline. On QNX you don't need a second thread and a lock for that. A timer can send a **pulse**, a small non-blocking message, to the same channel that receives your clients, so periodic work and client requests take turns in one loop.
+
+Open [`src/ticks.c`](src/ticks.c). `/dev/ticks` returns how many pulses have arrived. It has the same parts as `hello.c`, plus four new ones.
+
+**Choose a fixed priority.** `SCHED_FIFO` means this thread keeps the CPU until it blocks or something of higher priority is ready, instead of sharing time with lower-priority work.
+
+```c
+struct sched_param param = { .sched_priority = PRIORITY };
+pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+```
+
+**Keep it fixed.** [By default](https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.lib_ref/topic/c/channelcreate.html), a thread that receives a message takes the priority of the thread that sent it. That is what you want in most servers: it prevents priority inversion. Periodic work is different, because a low-priority client shouldn't be able to slow it down, so `ticks.c` creates its own channel with `_NTO_CHF_FIXED_PRIORITY` and hands it to the dispatch layer.
+
+```c
+int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY | _NTO_CHF_UNBLOCK | _NTO_CHF_DISCONNECT);
+dispatch_t *dpp = dispatch_create_channel(chid, 0);
+```
+
+You can see the difference. We first wrote this with plain `dispatch_create()`, and `pidin` printed `10f` instead of `20f`: the thread had just served `cat`, which runs at the shell's priority of 10. Swap the two lines and run steps 5 and 6 to try it; `boot.sh` will fail on the priority check.
+
+**Route a pulse code to a handler.** `pulse_attach()` tells the dispatch layer which function handles the pulse, and `message_connect()` opens a connection to your own channel for the timer to send through.
+
+```c
+int code = pulse_attach(dpp, MSG_FLAG_ALLOC_PULSE, 0, on_pulse, NULL);
+int coid = message_connect(dpp, MSG_FLAG_SIDE_CHANNEL);
+```
+
+**Arm the timer.** `SIGEV_PULSE_INIT` describes what the timer delivers, and `CLOCK_MONOTONIC` isn't affected if someone sets the system time.
+
+```c
+SIGEV_PULSE_INIT(&event, coid, PRIORITY, code, 0);
+timer_create(CLOCK_MONOTONIC, &event, &timer);
+timer_settime(timer, 0, &interval, NULL);
+```
+
+Step 5 already built `ticks` and step 6 already checked it. The boot script reads `/dev/ticks` twice, one second apart, and `boot.sh` requires the second value to be larger, then requires `pidin` to show the priority. That's the `ticks` line in step 6.
+
+In the `pidin` line, `20f` means priority 20 with the FIFO policy, and `RECEIVE` means the thread is blocked in `dispatch_block()`, waiting for its next pulse or client.
+
+This checks that pulses arrive and that the priority took effect. It doesn't measure timing: under QEMU, how exactly the pulses are spaced says nothing about a real target.
+
+## 8. Try next
 
 - Make `read()` return a counter that goes up on every `open()`. Store it in the OCB: define `IOFUNC_OCB_T` before including `<sys/iofunc.h>` and give the defaults your own `ocb_calloc`.
 - Add a `devctl()` command that resets the message to the default, and a small client that calls it.
+- Keep a per-open snapshot in the OCB for `/dev/ticks`, so a client that reads in small pieces can't see two different values.
 - Start `hello` with `procmgr_ability()` restrictions, so it keeps only the privileges it needs after `resmgr_attach()`.
 
 ## If something fails
 
 - `error: implicit declaration of function 'SETIOV'`: you compiled with `-std=c11` but without `-D_QNX_SOURCE`. Strict C11 hides the QNX-specific declarations unless you ask for them.
 - `read 1` is missing or empty: without `waitfor`, the first `cat` can run before `hello` has registered `/dev/hello`. Keep the `waitfor /dev/hello 10` after `hello &`.
+- `pthread_setschedparam: Operation not permitted`: the program needs the privilege to set `SCHED_FIFO`. The boot script runs it as root.
+- `codelab: ticks did not grow`: the timer isn't reaching the loop. Check that `dispatch_context_alloc()` comes after `pulse_attach()`, and that the pulse code passed to `SIGEV_PULSE_INIT` is the one `pulse_attach()` returned.
 - `boot.sh` exits 1: it prints the `codelab:` lines it found. Compare them with step 6. The full console is in `vm/output/console.log`.
 
 ## Tested with
